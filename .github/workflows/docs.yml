@@ -7,6 +7,12 @@ on:
   # 手动触发部署
   workflow_dispatch:
 
+# 添加权限配置
+permissions:
+  contents: write  # 允许写入内容
+  pages: write     # 允许操作 pages
+  id-token: write  # 允许生成 ID token
+
 jobs:
   docs:
     runs-on: ubuntu-latest
