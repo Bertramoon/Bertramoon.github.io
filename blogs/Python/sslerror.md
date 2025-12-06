@@ -2,10 +2,10 @@
 title: SSLError：dh key to small报错如何解决
 date: 2022/07/28
 tags:
- - 爬虫
- - 报错
+  - 爬虫
+  - 报错
 categories:
- - Python
+  - Python
 ---
 在使用爬虫库requests爬取页面时发生了"dh key to small"的错误，如下几种情况：
 
