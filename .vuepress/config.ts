@@ -11,7 +11,7 @@ export default defineUserConfig({
   // bundler: webpackBundler(),
   theme: recoTheme({
     logo: "/head.jpg",
-    docsRepo: "https://github.com/Bertramoon/personal-notes",
+    docsRepo: "https://github.com/Bertramoon/Bertramoon.github.io",
     docsBranch: "main",
     lastUpdated: true,
     lastUpdatedText: "最后更新时间",
