@@ -49,4 +49,12 @@ export default defineUserConfig({
       { text: "友情链接", link: "/friendship-link", icon: "IconFriendship" },
     ],
   }),
+  markdown: {
+    headers: {
+      level: [1, 2, 3]
+    },
+    toc: {
+      level: [1, 2, 3, 4]
+    }
+  }
 });
