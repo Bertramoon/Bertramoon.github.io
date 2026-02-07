@@ -1,0 +1,1 @@
+import{_ as t,c as e,o as a}from"./app-BB-7UZk_.js";const c={};function n(o,r){return a(),e("div")}const l=t(c,[["render",n]]),i=JSON.parse('{"path":"/tags/bianchengjichu/1.html","title":"","lang":"zh-CN","frontmatter":{"layout":"Categories"},"headers":[],"git":{},"filePathRelative":null}');export{l as comp,i as data};

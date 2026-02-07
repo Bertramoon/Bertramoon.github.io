@@ -1,0 +1,1 @@
+import{_ as t,c as e,o as a}from"./app-BB-7UZk_.js";const o={};function c(r,n){return a(),e("div")}const l=t(o,[["render",c]]),_=JSON.parse('{"path":"/tags/pachong/1.html","title":"","lang":"zh-CN","frontmatter":{"layout":"Categories"},"headers":[],"git":{},"filePathRelative":null}');export{l as comp,_ as data};
