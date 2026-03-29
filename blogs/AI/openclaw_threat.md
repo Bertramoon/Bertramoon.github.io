@@ -61,7 +61,7 @@ OpenClaw具备“致命三合一”：**接触不可信输入**、**访问私有
 
 5、在飞书中能进行飞书云文档等信息载体的读写
 
-<img src="openclaw_threat.assets/image-20260329172936843.png" alt="image-20260329172936843" style="zoom:67%;" />
+![image-20260329173724388](openclaw_threat.assets/image-20260329173724388.png)
 
 6、在飞书群聊中通过云文档等外部信息诱导openclaw读取敏感信息
 
