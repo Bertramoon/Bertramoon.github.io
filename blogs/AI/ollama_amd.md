@@ -2,7 +2,7 @@
 title: 如何使用AMD显卡跑本地大模型
 date: 2026/01/09
 tags:
-  - 工程实践
+  - 实践
 categories:
   - AI
 ---
