@@ -2,12 +2,14 @@ import { defineUserConfig } from "vuepress";
 import recoTheme from "vuepress-theme-reco";
 import { viteBundler } from '@vuepress/bundler-vite'
 import { webpackBundler } from '@vuepress/bundler-webpack'
+import { fixImgAssetPlugin } from './plugin-fix-img-asset'
 
 export default defineUserConfig({
   title: "Bertram的云笔记",
   description: "个人云笔记，记录个人学习和工作中的一些知识和感悟",
   lang: "zh-CN",
   bundler: viteBundler(),
+  plugins: [fixImgAssetPlugin],
   // bundler: webpackBundler(),
   theme: recoTheme({
     logo: "/head.jpg",
