@@ -3,13 +3,27 @@ import recoTheme from "vuepress-theme-reco";
 import { viteBundler } from '@vuepress/bundler-vite'
 import { webpackBundler } from '@vuepress/bundler-webpack'
 import { fixImgAssetPlugin } from './plugin-fix-img-asset'
+import { mediumZoomPlugin } from '@vuepress/plugin-medium-zoom'
+import { getDirname, path } from 'vuepress/utils'
+
+const __dirname = getDirname(import.meta.url)
 
 export default defineUserConfig({
   title: "Bertram的云笔记",
   description: "个人云笔记，记录个人学习和工作中的一些知识和感悟",
   lang: "zh-CN",
   bundler: viteBundler(),
-  plugins: [fixImgAssetPlugin],
+  plugins: [
+    fixImgAssetPlugin,
+    mediumZoomPlugin({
+      selector: '.theme-reco-md-content > img, .theme-reco-md-content :not(a) > img',
+      zoomOptions: {
+        background: 'inherit',
+      },
+      delay: 100,
+    }),
+  ],
+  clientConfigFile: path.resolve(__dirname, './client/clientConfig.ts'),
   // bundler: webpackBundler(),
   theme: recoTheme({
     logo: "/head.jpg",
