@@ -33,7 +33,7 @@ categories:
 - Rerank 模型配置（BAAI/bge-reranker-v2-m3）
 - Rerank Top-K 配置、最低相似度阈值配置
 
-<img src="个人知识库的初步建设实践总结.assets/image-20260726155444922.png" alt="image-20260726155444922" style="zoom:50%;" />
+<img src="personal_knowledge_summary.assets/image-20260726155444922.png" alt="image-20260726155444922" style="zoom:50%;" />
 
 ### 对话界面
 
@@ -44,7 +44,7 @@ categories:
 - 支持一键复制 LLM 回答内容（不含数据来源）
 - 流式输出、引用来源展示
 
-![image-20260726154445687](个人知识库的初步建设实践总结.assets/image-20260726154445687.png)
+![image-20260726154445687](personal_knowledge_summary.assets/image-20260726154445687.png)
 
 ### 知识库管理
 
@@ -53,9 +53,9 @@ categories:
 - 文档入库：会标记当前文档状态（已入库 / 未入库），支持一键入库或者所有文档进行重新入库，是一个非常使用的功能，在新增文档或者修改chunking相关配置时会很有用
 - 查看每个文档的 RAG 切分结果（各文档块内容）：是进行初步验证的辅助功能，能看到chunking结果是否符合预期
 
-![image-20260726160157554](个人知识库的初步建设实践总结.assets/image-20260726160157554.png)
+![image-20260726160157554](personal_knowledge_summary.assets/image-20260726160157554.png)
 
-<img src="个人知识库的初步建设实践总结.assets/image-20260726160518128.png" alt="image-20260726160518128" style="zoom:50%;" />
+<img src="personal_knowledge_summary.assets/image-20260726160518128.png" alt="image-20260726160518128" style="zoom:50%;" />
 
 ### 量化测试
 
@@ -66,9 +66,9 @@ categories:
 - 测试结果包含：每次命中的文档块 ID、命中率
 - 支持勾选多个测试用例并行执行
 
-<img src="个人知识库的初步建设实践总结.assets/image-20260726160610674.png" alt="image-20260726160610674" style="zoom:67%;" />
+<img src="personal_knowledge_summary.assets/image-20260726160610674.png" alt="image-20260726160610674" style="zoom:67%;" />
 
-<img src="个人知识库的初步建设实践总结.assets/image-20260726160624823.png" alt="image-20260726160624823" style="zoom:80%;" />
+<img src="personal_knowledge_summary.assets/image-20260726160624823.png" alt="image-20260726160624823" style="zoom:80%;" />
 
 ### 会话管理
 
@@ -104,17 +104,17 @@ categories:
 
 作为对比，我尝试了RAGFlow默认配置下通用切片同样的笔记，效果就非常差。例如，提问"应用安全工程师的核心能力有哪些？"的时候，RAGFlow只能回答到2-3个。只有明确提问"应用安全工程师的五大核心能力有哪些？"时才能得到4-5个能力的答案，语义表现非常差。
 
-<img src="个人知识库的初步建设实践总结.assets/image-20260726181245580.png" alt="image-20260726181245580" style="zoom:50%;" />
+<img src="personal_knowledge_summary.assets/image-20260726181245580.png" alt="image-20260726181245580" style="zoom:50%;" />
 
 ### 选择合适的模型
 
-在最早的时候，我使用了nomic-embed-text作为embedding模型，但是在中文语境下表现很差，导致向量余弦相似度的结果完全不符合预期，甚至一度以为是chunking结果不行。
+千万不要轻视模型的重要性。在最早的时候，我使用了nomic-embed-text作为embedding模型，但是在中文语境下表现很差，导致向量余弦相似度的结果完全不符合预期，甚至一度以为是chunking结果不行。
 
 后面搜索了相关模型，最终决定embedding和reranker模型都使用BAAI的模型，分别是bge-m3和bge-reranker-v2-m3，这才使得整个表现完美符合我当前的需求。
 
 ### 可量化的测试才可靠
 
-如果缺少可量化测试，就会发生以下问题
+如果缺少可量化测试，至少会发生以下问题
 
 - 无从知道引用的文档块是不是符合预期的，叠加上LLM的调用，会导致完全不知道LLM的回答是否准确和正确，知识库就失去意义了
-- 当chunking策略、模型配置、RAG配置进行调整后，可量化测试可以让我们不必每次都要重新手动测试，而是可以批量自动化测试，从而知道这次调整或者优化是否符合预期
+- 每次chunking策略、模型配置、RAG配置进行调整后，都要重新进行手动测试，以验证调整或者优化后的知识库系统是否能符合预期
