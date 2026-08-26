@@ -23,7 +23,7 @@ categories:
 2. **十六进制 IP 地址绕过**
    同理，将 IP 的某一段或整体转为十六进制，如 `0x0A.0.0.1`（`0x0A` = 10）。防护层黑名单直接匹配会失败，从而放行；而操作系统能正确转换为目标内网 IP。
    
-3. **长整型IP 地址绕过**
+3. **长整型 IP 地址绕过**
    将整个 IPv4 地址视为一个 32 位无符号整数，例如 `10.0.0.1` 对应的整数为 `167772161`（计算方式：10×256³ + 0×256² + 0×256 + 1）。防护层因格式不符合点分 IPv4操作系统库函数会自动将其转换为 `10.0.0.1` 并建立连接。此外，其八进制表示形式`01200000001`和十六进制表示形式`0xA000001`同样可以进行绕过
    
 4. **IP 地址省略写法绕过**
@@ -826,41 +826,54 @@ class _PinnedAdapter(HTTPAdapter):
 
 
 class SSRFHttpClient:
-    def fetch(self, url):
-        return self._fetch(url, 0)
+    @classmethod
+    def fetch(cls, url):
+        return cls._fetch(url, 0)
 
-    def _fetch(self, url, hop):
+    @classmethod
+    def _fetch(cls, url, hop):
         if hop > MAX_REDIRECTS:
             raise SSRFError("too many redirects")
 
-        parsed = self._parse(url)
+        # 1. 统一解析URL
+        parsed = cls._parse(url)
         scheme = parsed.scheme.lower()
         host = parsed.hostname.lower()
         port = parsed.port
-        literal = self._resolve_literal_or_domain(host)
+        # 解析host是域名还是IP
+        literal = cls._resolve_literal_or_domain(host)
         if literal is not None:
+            # 2.2. 校验域名（直接传入IP时直接拒绝）
             if ALLOWED_DOMAINS:
                 raise SSRFError("IP literal not allowed with domain whitelist")
-            self._check_ip(literal)
+            # 3. 校验IP
+            cls._check_ip(literal)
             pinned = str(literal)
         else:
+            # 2.2. 校验域名
             if ALLOWED_DOMAINS and host not in ALLOWED_DOMAINS:
                 raise SSRFError("domain not allowed")
-            addrs = self._resolve_all(host, scheme, port)
+            addrs = cls._resolve_all(host, scheme, port)
             for ip in addrs:
-                self._check_ip(ip)
+                # 3. 校验IP
+                cls._check_ip(ip)
+            # TODO DNS pinning为什么只pinning第一个IP？是有限制吗？如果没有限制，应该把所有IP都pinning才是正确的
             pinned = str(addrs[0])
 
-        canonical = urlunsplit(
-            (scheme, _format_netloc(host, port), parsed.path or "/", parsed.query, parsed.fragment)
-        )
-
         session = requests.Session()
+        # 忽略代理、自定义CA
         session.trust_env = False
+        # 4. DNS Pinning
         adapter = _PinnedAdapter(pinned)
         session.mount("http://", adapter)
         session.mount("https://", adapter)
 
+        # 5. 提取标准化URL
+        canonical = urlunsplit(
+            (scheme, cls._format_netloc(host, port), parsed.path or "/", parsed.query, parsed.fragment)
+        )
+
+        # 6. 发起请求，并手动重定向
         try:
             resp = session.get(canonical, allow_redirects=False, timeout=TIMEOUT)
         except Exception:
@@ -870,27 +883,41 @@ class SSRFHttpClient:
             location = resp.headers.get("Location")
             if not location:
                 raise SSRFError("redirect without Location")
-            return self._fetch(urljoin(url, location), hop + 1)
+            return cls._fetch(urljoin(url, location), hop + 1)
 
         return resp
 
-    def _parse(self, url):
+    @staticmethod
+    def _parse(url):
+        """
+        标准化解析URL
+        """
         if not isinstance(url, str) or len(url) > 2048:
             raise SSRFError("invalid URL")
+        # TODO 这里的黑名单字符校验显然是不够的，但是不做校验也不行，因为存在"\"等字符绕过问题。我的建议是，你查询以下RFC对于URL字符的标准，白名单只允许这部分字符存在于URL中
         if re.search(r"[\\\x00-\x1f\x7f]", url):
             raise SSRFError("invalid URL")
         parsed = urlsplit(url)
         if not parsed.scheme or not parsed.hostname:
             raise SSRFError("invalid URL")
+        # 2.1. 校验协议，限制协议只能为http/https
         if parsed.scheme.lower() not in ALLOWED_SCHEMES:
             raise SSRFError("scheme not allowed")
+        # 端口验证，当输入的端口不是数字或端口范围不正常时，此处解析会失败报错
         try:
             parsed.port
         except ValueError:
             raise SSRFError("invalid port")
         return parsed
 
-    def _resolve_literal_or_domain(self, host):
+    @staticmethod
+    def _resolve_literal_or_domain(host):
+        """
+        处理域名或IP
+        - 如果是IPv6/IPv4地址，返回IPv6Address/IPv4Address
+        - 如果是点分IPv4格式但是不是标准的点分十进制（如点分八进制、点分十六进制、点分省略写法、长整型IP地址），抛出错误
+        - 否则，认为是域名
+        """
         if ":" in host:
             try:
                 return ipaddress.ip_address(host)
@@ -902,7 +929,11 @@ class SSRFHttpClient:
             raise SSRFError("non-canonical IP format")
         return None
 
-    def _resolve_all(self, host, scheme, port):
+    @staticmethod
+    def _resolve_all(host, scheme, port) -> list:
+        """
+        获取目标域名对应的IP地址列表
+        """
         if port is None:
             port = 443 if scheme == "https" else 80
         try:
@@ -918,7 +949,8 @@ class SSRFHttpClient:
             raise SSRFError("no address resolved")
         return addrs
 
-    def _check_ip(self, ip):
+    @staticmethod
+    def _check_ip(ip):
         if isinstance(ip, ipaddress.IPv6Address):
             try:
                 mapped = ip.ipv4_mapped
@@ -942,7 +974,6 @@ class SSRFHttpClient:
 **使用与注意：**
 
 - 需要 `requests>=2` 且底层 `urllib3>=2.0`（`_dns_host` 仅在 urllib3 2.x 存在）
-- 白名单域名建议先做 IDN → Punycode 规范化（`idna` 库）再匹配
 - 生产环境如需自定义 CA（如企业内网 CA），可把 `session.verify` 配置为 CA 路径
 - `urlsplit` 对 IP 字面量的解析不参与实际拨号：实际连接永远走 `_pinned_ip`，域名与解析结果解耦，DNS Rebinding 无法生效
 
