@@ -701,7 +701,7 @@ PinningResolverProvider
 
 ### Python
 
-**方案说明：**基于 `requests`（底层 urllib3 2.x）。Pinning 通过自定义 urllib3 连接类实现：拨号时把 `_dns_host` 临时替换为固定 IP，而 `host`（Host 头、SNI、TLS 证书校验）全程保持原始域名，因此 HTTP/HTTPS 均正确。解析用标准库 `urllib.parse.urlsplit`，但在解析前**先拒绝反斜杠与控制字符**，封死 `\` + `@` 类的解析器分歧。
+**方案说明：**基于 `requests`（底层 urllib3 2.x）。Pinning 通过自定义 urllib3 连接类实现：拨号时把 `_dns_host` 临时替换为固定 IP，而 `host`（Host 头、SNI、TLS 证书校验）全程保持原始域名，因此 HTTP/HTTPS 均正确。解析用标准库 `urllib.parse.urlsplit`，但在解析前使用白名单限制只允许合法的URL字符，封死 `\` + `@` 类的解析器分歧。
 
 **几个实现要点：**
 
@@ -732,6 +732,7 @@ IPV4_CANONICAL = re.compile(
     r"^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)"
     r"(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$"
 )
+URL_CHARS = re.compile(r"^[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+$")
 
 ALLOWED_SCHEMES = ("http", "https")
 ALLOWED_DOMAINS = {"api.example.com"}
@@ -745,7 +746,6 @@ BLOCKLIST = [
     ipaddress.ip_network("100.64.0.0/10"),
     ipaddress.ip_network("::/128"),
     ipaddress.ip_network("::1/128"),
-    ipaddress.ip_network("::ffff:0:0/96"),
     ipaddress.ip_network("fc00::/7"),
     ipaddress.ip_network("fe80::/10"),
 ]
@@ -754,15 +754,21 @@ TIMEOUT = 5
 
 
 class _PinnedConnMixin:
-    _pinned_ip = None
+    _pinned_ips = ()
 
     def _new_conn(self):
-        if not self._pinned_ip:
+        if not self._pinned_ips:
             return super()._new_conn()
         original = self._dns_host
-        self._dns_host = self._pinned_ip
         try:
-            return super()._new_conn()
+            last = None
+            for ip in self._pinned_ips:
+                self._dns_host = ip
+                try:
+                    return super()._new_conn()
+                except Exception as exc:
+                    last = exc
+            raise last
         finally:
             self._dns_host = original
 
@@ -777,27 +783,27 @@ class _PinnedHTTPSConnection(_PinnedConnMixin, HTTPSConnection):
 
 class _PinnedHTTPConnectionPool(HTTPConnectionPool):
     ConnectionCls = _PinnedHTTPConnection
-    _pinned_ip = None
+    _pinned_ips = ()
 
     def _new_conn(self):
         conn = super()._new_conn()
-        conn._pinned_ip = self._pinned_ip
+        conn._pinned_ips = self._pinned_ips
         return conn
 
 
 class _PinnedHTTPSConnectionPool(HTTPSConnectionPool):
     ConnectionCls = _PinnedHTTPSConnection
-    _pinned_ip = None
+    _pinned_ips = ()
 
     def _new_conn(self):
         conn = super()._new_conn()
-        conn._pinned_ip = self._pinned_ip
+        conn._pinned_ips = self._pinned_ips
         return conn
 
 
 class _PinnedPoolManager(PoolManager):
-    def __init__(self, pinned_ip, **kwargs):
-        self._pinned_ip = pinned_ip
+    def __init__(self, pinned_ips, **kwargs):
+        self._pinned_ips = pinned_ips
         super().__init__(**kwargs)
         self.pool_classes_by_scheme = {
             "http": _PinnedHTTPConnectionPool,
@@ -806,18 +812,18 @@ class _PinnedPoolManager(PoolManager):
 
     def _new_pool(self, scheme, host, port, request_context=None):
         pool = super()._new_pool(scheme, host, port, request_context)
-        pool._pinned_ip = self._pinned_ip
+        pool._pinned_ips = self._pinned_ips
         return pool
 
 
 class _PinnedAdapter(HTTPAdapter):
-    def __init__(self, pinned_ip):
-        self._pinned_ip = pinned_ip
+    def __init__(self, pinned_ips):
+        self._pinned_ips = pinned_ips
         super().__init__()
 
     def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
         self.poolmanager = _PinnedPoolManager(
-            self._pinned_ip,
+            self._pinned_ips,
             num_pools=connections,
             maxsize=maxsize,
             block=block,
@@ -848,7 +854,7 @@ class SSRFHttpClient:
                 raise SSRFError("IP literal not allowed with domain whitelist")
             # 3. 校验IP
             cls._check_ip(literal)
-            pinned = str(literal)
+            pinned = [str(literal)]
         else:
             # 2.2. 校验域名
             if ALLOWED_DOMAINS and host not in ALLOWED_DOMAINS:
@@ -857,11 +863,10 @@ class SSRFHttpClient:
             for ip in addrs:
                 # 3. 校验IP
                 cls._check_ip(ip)
-            # TODO DNS pinning为什么只pinning第一个IP？是有限制吗？如果没有限制，应该把所有IP都pinning才是正确的
-            pinned = str(addrs[0])
+            pinned = [str(ip) for ip in addrs]
 
         session = requests.Session()
-        # 忽略代理、自定义CA
+        # 忽略代理
         session.trust_env = False
         # 4. DNS Pinning
         adapter = _PinnedAdapter(pinned)
@@ -876,8 +881,8 @@ class SSRFHttpClient:
         # 6. 发起请求，并手动重定向
         try:
             resp = session.get(canonical, allow_redirects=False, timeout=TIMEOUT)
-        except Exception:
-            raise SSRFError("connection failed")
+        except Exception as exc:
+            raise SSRFError("connection failed") from exc
 
         if resp.status_code in (301, 302, 303, 307, 308):
             location = resp.headers.get("Location")
@@ -894,10 +899,12 @@ class SSRFHttpClient:
         """
         if not isinstance(url, str) or len(url) > 2048:
             raise SSRFError("invalid URL")
-        # TODO 这里的黑名单字符校验显然是不够的，但是不做校验也不行，因为存在"\"等字符绕过问题。我的建议是，你查询以下RFC对于URL字符的标准，白名单只允许这部分字符存在于URL中
-        if re.search(r"[\\\x00-\x1f\x7f]", url):
+        if not URL_CHARS.match(url):
             raise SSRFError("invalid URL")
-        parsed = urlsplit(url)
+        try:
+            parsed = urlsplit(url)
+        except ValueError:
+            raise SSRFError("invalid URL")
         if not parsed.scheme or not parsed.hostname:
             raise SSRFError("invalid URL")
         # 2.1. 校验协议，限制协议只能为http/https
@@ -975,7 +982,7 @@ class SSRFHttpClient:
 
 - 需要 `requests>=2` 且底层 `urllib3>=2.0`（`_dns_host` 仅在 urllib3 2.x 存在）
 - 生产环境如需自定义 CA（如企业内网 CA），可把 `session.verify` 配置为 CA 路径
-- `urlsplit` 对 IP 字面量的解析不参与实际拨号：实际连接永远走 `_pinned_ip`，域名与解析结果解耦，DNS Rebinding 无法生效
+- `urlsplit` 对 IP 字面量的解析不参与实际拨号：实际连接永远走 `_pinned_ips`，域名与解析结果解耦，DNS Rebinding 无法生效
 
 ## 为什么SSRF面临的问题那么多，但却很少感知到？
 
