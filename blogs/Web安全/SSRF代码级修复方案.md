@@ -362,354 +362,9 @@ fd00:ec2::254 => AWS IPv6 元数据（已包含在fc00::/7网段覆盖范围之�
 
 ## 代码级修复方案
 
-### Java
-
-**方案说明：**使用 JDK 11+ 自带的 `java.net.http.HttpClient`，无第三方依赖。DNS Pinning 通过 JDK 18+ 新增的 `InetAddressResolverProvider` SPI 实现：发出请求前把"域名 → 已校验通过的固定 IP"写入解析器，HttpClient 解析域名时直接得到该固定 IP，而 Host 头、SNI、TLS 证书校验仍按 URL 中的域名进行，因此 HTTP 与 HTTPS 都能正确处理。
-
-实现分 3 个部分：
-
-1. `SsrfSafeClient.java` —— 完整六步校验流程 + 手动重定向
-2. `PinningResolverProvider.java` —— DNS Pinning 的解析器 SPI 实现
-3. `META-INF/services/java.net.spi.InetAddressResolverProvider` —— SPI 注册文件（内容只有一行：`PinningResolverProvider`）
-
-**几个实现要点：**
-
-- `new URI(url)` 解析即"默认拒绝"：反斜杠 `\`、非法字符直接抛 `URISyntaxException` 被拒绝（天然封死 CVE-2026-2020 那类 `\` + `@` 的解析器分歧）；`@` 之前的部分自动剥离为 userinfo，嵌套 `@` 时 `getHost()` 返回 `null` 直接拒绝
-- `ALLOWED_DOMAINS`（域名白名单）与 `BLOCKLIST`（IP 黑名单）是配置点：白名单为空时退化为纯黑名单模式；白名单非空时 IP 字面量直连一律拒绝
-- IP 字面量强制规范形式：八进制、十六进制、整数、省略写法等一律拒绝（拒绝畸形格式）
-- `InetAddress.getAllByName` 取回**全部** A/AAAA 记录逐一校验
-- 所有校验/连接失败均返回脱敏后的统一错误信息，不暴露内网可达性
-
-`SsrfSafeClient.java`：
-
-```java
-import java.io.IOException;
-import java.net.Inet6Address;
-import java.net.InetAddress;
-import java.net.URI;
-import java.net.URISyntaxException;
-import java.net.UnknownHostException;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
-import java.time.Duration;
-import java.util.Arrays;
-import java.util.List;
-import java.util.Locale;
-import java.util.Set;
-import java.util.regex.Pattern;
-
-public class SsrfSafeClient {
-
-    private static final Set<String> ALLOWED_SCHEMES = Set.of("http", "https");
-    static Set<String> ALLOWED_DOMAINS = Set.of("api.example.com");
-    static List<Cidr> BLOCKLIST = List.of(
-            Cidr.of("0.0.0.0/8"), Cidr.of("10.0.0.0/8"), Cidr.of("127.0.0.0/8"),
-            Cidr.of("169.254.0.0/16"), Cidr.of("172.16.0.0/12"), Cidr.of("192.168.0.0/16"),
-            Cidr.of("100.64.0.0/10"),
-            Cidr.of("::/128"), Cidr.of("::1/128"), Cidr.of("::ffff:0:0/96"),
-            Cidr.of("fc00::/7"), Cidr.of("fe80::/10"));
-    private static final int MAX_REDIRECTS = 3;
-    private static final Duration TIMEOUT = Duration.ofSeconds(5);
-    private static final Pattern IPV4_CANONICAL = Pattern.compile(
-            "(25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)(\\.(25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)){3}");
-
-    private final HttpClient client;
-
-    public SsrfSafeClient() {
-        this.client = HttpClient.newBuilder()
-                .followRedirects(HttpClient.Redirect.NEVER)
-                .connectTimeout(TIMEOUT)
-                .build();
-    }
-
-    public String fetch(String url) throws IOException, InterruptedException {
-        return fetch(url, 0);
-    }
-
-    private String fetch(String url, int hop) throws IOException, InterruptedException {
-        if (hop > MAX_REDIRECTS) {
-            throw new SecurityException("too many redirects");
-        }
-
-        URI uri = parse(url);
-
-        String scheme = uri.getScheme() == null ? "" : uri.getScheme().toLowerCase(Locale.ROOT);
-        if (!ALLOWED_SCHEMES.contains(scheme)) {
-            throw new SecurityException("scheme not allowed");
-        }
-
-        String host = uri.getHost();
-        if (host == null) {
-            throw new SecurityException("invalid host");
-        }
-        host = host.toLowerCase(Locale.ROOT);
-        if (host.startsWith("[") && host.endsWith("]")) {
-            host = host.substring(1, host.length() - 1);
-        }
-
-        InetAddress pinned = resolveTarget(host);
-
-        PinningResolverProvider.pin(host, pinned.getAddress());
-        try {
-            HttpRequest request = HttpRequest.newBuilder(uri)
-                    .timeout(TIMEOUT)
-                    .GET()
-                    .build();
-            HttpResponse<String> response;
-            try {
-                response = client.send(request, HttpResponse.BodyHandlers.ofString());
-            } catch (IOException e) {
-                throw new SecurityException("connection failed");
-            }
-            if (isRedirect(response.statusCode())) {
-                String location = response.headers().firstValue("Location")
-                        .orElseThrow(() -> new SecurityException("redirect without Location"));
-                URI next;
-                try {
-                    next = uri.resolve(location);
-                } catch (IllegalArgumentException e) {
-                    throw new SecurityException("invalid redirect target");
-                }
-                return fetch(next.toString(), hop + 1);
-            }
-            return response.body();
-        } finally {
-            PinningResolverProvider.unpin(host);
-        }
-    }
-
-    private InetAddress resolveTarget(String host) throws SecurityException {
-        InetAddress literal = parseLiteral(host);
-        if (literal != null) {
-            if (!ALLOWED_DOMAINS.isEmpty()) {
-                throw new SecurityException("IP literal not allowed with domain whitelist");
-            }
-            checkIp(literal);
-            return literal;
-        }
-        if (!ALLOWED_DOMAINS.isEmpty() && !ALLOWED_DOMAINS.contains(host)) {
-            throw new SecurityException("domain not allowed");
-        }
-        try {
-            InetAddress[] addrs = InetAddress.getAllByName(host);
-            InetAddress first = null;
-            for (InetAddress addr : addrs) {
-                checkIp(addr);
-                if (first == null) {
-                    first = addr;
-                }
-            }
-            if (first == null) {
-                throw new SecurityException("no address resolved");
-            }
-            return first;
-        } catch (UnknownHostException e) {
-            throw new SecurityException("DNS resolution failed");
-        }
-    }
-
-    private static InetAddress parseLiteral(String host) throws SecurityException {
-        String h = host;
-        if (h.startsWith("[") && h.endsWith("]")) {
-            h = h.substring(1, h.length() - 1);
-        }
-        if (h.indexOf(':') >= 0) {
-            try {
-                return InetAddress.getByName(h);
-            } catch (UnknownHostException e) {
-                throw new SecurityException("invalid IPv6 literal");
-            }
-        }
-        if (h.toLowerCase(Locale.ROOT).startsWith("0x")) {
-            throw new SecurityException("non-canonical IP format");
-        }
-        if (h.matches("[0-9.]+")) {
-            if (!IPV4_CANONICAL.matcher(h).matches()) {
-                throw new SecurityException("non-canonical IPv4 format");
-            }
-            String[] parts = h.split("\\.");
-            byte[] bytes = new byte[4];
-            for (int i = 0; i < 4; i++) {
-                bytes[i] = (byte) Integer.parseInt(parts[i]);
-            }
-            try {
-                return InetAddress.getByAddress(bytes);
-            } catch (UnknownHostException e) {
-                throw new IllegalStateException(e);
-            }
-        }
-        return null;
-    }
-
-    private static void checkIp(InetAddress addr) throws SecurityException {
-        for (Cidr cidr : BLOCKLIST) {
-            if (cidr.contains(addr)) {
-                throw new SecurityException("target IP is blocked");
-            }
-        }
-    }
-
-    private static InetAddress normalize(InetAddress addr) {
-        if (addr instanceof Inet6Address) {
-            byte[] b = addr.getAddress();
-            boolean mapped = true;
-            for (int i = 0; i < 10; i++) {
-                if (b[i] != 0) {
-                    mapped = false;
-                    break;
-                }
-            }
-            if (mapped && b[10] == (byte) 0xff && b[11] == (byte) 0xff) {
-                try {
-                    return InetAddress.getByAddress(Arrays.copyOfRange(b, 12, 16));
-                } catch (UnknownHostException ignored) {
-                }
-            }
-        }
-        return addr;
-    }
-
-    private static URI parse(String url) throws SecurityException {
-        try {
-            return new URI(url);
-        } catch (URISyntaxException e) {
-            throw new SecurityException("malformed URL");
-        }
-    }
-
-    private static boolean isRedirect(int status) {
-        return status == 301 || status == 302 || status == 303 || status == 307 || status == 308;
-    }
-
-    static final class Cidr {
-        private final InetAddress network;
-        private final int prefixLength;
-
-        private Cidr(InetAddress network, int prefixLength) {
-            this.network = network;
-            this.prefixLength = prefixLength;
-        }
-
-        static Cidr of(String spec) {
-            String[] parts = spec.split("/");
-            try {
-                return new Cidr(InetAddress.getByName(parts[0]), Integer.parseInt(parts[1]));
-            } catch (UnknownHostException e) {
-                throw new IllegalArgumentException("bad CIDR: " + spec, e);
-            }
-        }
-
-        boolean contains(InetAddress addr) {
-            byte[] a = normalize(addr).getAddress();
-            byte[] n = network.getAddress();
-            if (a.length != n.length) {
-                return false;
-            }
-            int bits = prefixLength;
-            for (int i = 0; i < a.length && bits > 0; i++) {
-                int consume = Math.min(8, bits);
-                int mask = (0xff << (8 - consume)) & 0xff;
-                if ((a[i] & mask) != (n[i] & mask)) {
-                    return false;
-                }
-                bits -= consume;
-            }
-            return true;
-        }
-
-        @Override
-        public String toString() {
-            return network.getHostAddress() + "/" + prefixLength;
-        }
-    }
-}
-```
-
-`PinningResolverProvider.java`：
-
-```java
-import java.net.InetAddress;
-import java.net.UnknownHostException;
-import java.net.spi.InetAddressResolver;
-import java.net.spi.InetAddressResolverProvider;
-import java.util.Locale;
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.stream.Stream;
-
-public final class PinningResolverProvider extends InetAddressResolverProvider {
-
-    private static final Map<String, byte[]> PINS = new ConcurrentHashMap<>();
-
-    public static void pin(String host, byte[] address) {
-        PINS.put(normalize(host), address);
-    }
-
-    public static void unpin(String host) {
-        PINS.remove(normalize(host));
-    }
-
-    private static String normalize(String host) {
-        String h = host.toLowerCase(Locale.ROOT);
-        if (h.startsWith("[") && h.endsWith("]")) {
-            h = h.substring(1, h.length() - 1);
-        }
-        return h;
-    }
-
-    @Override
-    public String name() {
-        return "pinning-resolver";
-    }
-
-    @Override
-    public InetAddressResolver get(Configuration configuration) {
-        return new InetAddressResolver() {
-            @Override
-            public Stream<InetAddress> lookupByName(String host, LookupPolicy lookupPolicy)
-                    throws UnknownHostException {
-                byte[] pinned = PINS.get(normalize(host));
-                if (pinned != null) {
-                    return Stream.of(InetAddress.getByAddress(host, pinned));
-                }
-                return configuration.builtinResolver().lookupByName(host, lookupPolicy);
-            }
-
-            @Override
-            public String lookupByAddress(byte[] addr) throws UnknownHostException {
-                return configuration.builtinResolver().lookupByAddress(addr);
-            }
-        };
-    }
-}
-```
-
-`META-INF/services/java.net.spi.InetAddressResolverProvider` 注册文件（把 `PinningResolverProvider` 放入 classpath 的 `META-INF/services` 目录下，使 SPI 全局生效）：
-
-```
-PinningResolverProvider
-```
-
-**使用与注意：**
-
-- 解析器 SPI 是 JVM 全局的：注册后所有 `InetAddress` 查询都会先经过 `lookupByName`，未 pin 的 host 委托给内置解析器，对业务透明；每个请求只在"发送前 → 发送后 finally"窗口内写入 pin
-- 关键点：pin 时用 `InetAddress.getByAddress(host, pinned)` 把原始 hostname 附着在地址上，否则 JDK 会拿解析出的 IP 做 TLS 证书校验/SNI，导致 HTTPS 对虚拟主机失效
-- 若目标环境是 JDK 11-17（无 `InetAddressResolverProvider`），可用 OkHttp 的 `Dns` 接口实现等效 Pinning；纯 JDK 方案下 HTTPS 需 JDK 18+
-- 白名单域名建议同时做 IDN → Punycode 规范化（`java.net.IDN`）后再匹配
-- 高并发场景下，全局 `PINS` 按 host 读写：同一 host 并发 fetch 到不同 IP 时可能存在短窗口覆盖，若需严格隔离可改为按 host 加锁
-
 ### Python
 
 **方案说明：**基于 `requests`（底层 urllib3 2.x）。Pinning 通过自定义 urllib3 连接类实现：拨号时把 `_dns_host` 临时替换为固定 IP，而 `host`（Host 头、SNI、TLS 证书校验）全程保持原始域名，因此 HTTP/HTTPS 均正确。解析用标准库 `urllib.parse.urlsplit`，但在解析前使用白名单限制只允许合法的URL字符，封死 `\` + `@` 类的解析器分歧。
-
-**几个实现要点：**
-
-- IP 字面量强制规范形式；解析出的**全部** getaddrinfo 记录逐一校验
-- `_PinnedConnMixin._new_conn` 只在拨号瞬间切换 `_dns_host`（try/finally 恢复），`self.host` 不变，所以 Host 头与 TLS 校验仍用域名
-- 每次 fetch 使用独立 Session 并设置 `trust_env = False`，忽略系统代理（防止代理被用作绕过手段）
-- `allow_redirects=False` 手动重定向，每个跳转重新走完整校验
-- 域名白名单启用时拒绝 IP 字面量直连；所有失败统一抛 `SSRFError`（脱敏）
 
 ```python
 import ipaddress
@@ -982,7 +637,345 @@ class SSRFHttpClient:
 
 - 需要 `requests>=2` 且底层 `urllib3>=2.0`（`_dns_host` 仅在 urllib3 2.x 存在）
 - 生产环境如需自定义 CA（如企业内网 CA），可把 `session.verify` 配置为 CA 路径
-- `urlsplit` 对 IP 字面量的解析不参与实际拨号：实际连接永远走 `_pinned_ips`，域名与解析结果解耦，DNS Rebinding 无法生效
 
-## 为什么SSRF面临的问题那么多，但却很少感知到？
+### Java
+
+**方案说明：**基于 OkHttp，DNS Pinning 通过 OkHttp 的 `Dns` 接口实现：解析使用 JDK 权威的 `java.net.URI`，它在解析阶段即默认拒绝反斜杠、非法字符与嵌套 `@` 等畸形输入。
+
+`SSRFError.java`：
+
+```java
+public class SSRFError extends RuntimeException {
+    public SSRFError(String message) {
+        super(message);
+    }
+}
+```
+
+`SsrfSafeClient.java`：
+
+```java
+import okhttp3.Dns;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.Response;
+import okhttp3.ResponseBody;
+
+import java.io.IOException;
+import java.net.Inet6Address;
+import java.net.InetAddress;
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.net.UnknownHostException;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
+import java.util.regex.Pattern;
+
+public class SsrfSafeClient {
+
+    private static final Set<String> ALLOWED_SCHEMES =
+            Collections.unmodifiableSet(new HashSet<>(Arrays.asList("http", "https")));
+    static Set<String> ALLOWED_DOMAINS =
+            new HashSet<>(Arrays.asList("api.example.com"));
+    private static final List<Cidr> BLOCKLIST = Collections.unmodifiableList(Arrays.asList(
+            Cidr.of("0.0.0.0/8"),
+            Cidr.of("10.0.0.0/8"),
+            Cidr.of("127.0.0.0/8"),
+            Cidr.of("169.254.0.0/16"),
+            Cidr.of("172.16.0.0/12"),
+            Cidr.of("192.168.0.0/16"),
+            Cidr.of("100.64.0.0/10"),
+            Cidr.of("::/128"),
+            Cidr.of("::1/128"),
+            Cidr.of("fc00::/7"),
+            Cidr.of("fe80::/10")));
+
+    private static final int MAX_REDIRECTS = 3;
+    private static final long TIMEOUT_MS = 5000;
+    private static final int MAX_URL_LENGTH = 2048;
+    private static final Pattern IPV4_CANONICAL = Pattern.compile(
+            "(25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)(\\.(25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)){3}");
+
+    private static final ThreadLocal<List<InetAddress>> PINNED = new ThreadLocal<>();
+
+    private static final Dns PINNING_DNS = hostname -> {
+        List<InetAddress> pinned = PINNED.get();
+        if (pinned != null) {
+            return pinned;
+        }
+        return Dns.SYSTEM.lookup(hostname);
+    };
+
+    private final OkHttpClient client;
+
+    public SsrfSafeClient() {
+        this.client = new OkHttpClient.Builder()
+                .followRedirects(false)
+                .connectTimeout(TIMEOUT_MS, TimeUnit.MILLISECONDS)
+                .readTimeout(TIMEOUT_MS, TimeUnit.MILLISECONDS)
+                .writeTimeout(TIMEOUT_MS, TimeUnit.MILLISECONDS)
+                .dns(PINNING_DNS)
+                .build();
+    }
+
+    public String fetch(String url) {
+        return fetch(url, 0);
+    }
+
+    private String fetch(String url, int hop) {
+        if (hop > MAX_REDIRECTS) {
+            throw new SSRFError("too many redirects");
+        }
+
+        // 1. 统一解析 URL（new URI 即"默认拒绝"：反斜杠、非法字符抛异常；@ 前部分剥离为 userinfo）
+        URI uri = parse(url);
+
+        // 2.1 校验协议：只允许 http/https
+        String scheme = uri.getScheme() == null ? "" : uri.getScheme().toLowerCase(Locale.ROOT);
+        if (!ALLOWED_SCHEMES.contains(scheme)) {
+            throw new SSRFError("scheme not allowed");
+        }
+
+        String host = uri.getHost();
+        if (host == null) {
+            throw new SSRFError("invalid host");
+        }
+        host = host.toLowerCase(Locale.ROOT);
+        if (host.startsWith("[") && host.endsWith("]")) {
+            host = host.substring(1, host.length() - 1);
+        }
+        int port = uri.getPort();
+        if (port > 65535 || port < 1) {
+            throw new SSRFError("invalid port");
+        }
+
+        // 2.2 校验域名 + 3. 校验 IP（解析全部记录并逐一校验）
+        List<InetAddress> pinned = resolveTarget(host);
+
+        // 5. 提取标准化 URL：统一拼回规范格式，屏蔽解析器差异
+        String canonical = formatUrl(uri, host, port);
+
+        // 4 + 6. DNS Pinning + 发起请求（手动处理重定向）
+        PINNED.set(pinned);
+        try {
+            Request request = new Request.Builder().url(canonical).get().build();
+            try (Response response = client.newCall(request).execute()) {
+                if (isRedirect(response.code())) {
+                    String location = response.header("Location");
+                    if (location == null) {
+                        throw new SSRFError("redirect without Location");
+                    }
+                    String next = uri.resolve(location).toString();
+                    return fetch(next, hop + 1);
+                }
+                ResponseBody body = response.body();
+                return body == null ? "" : body.string();
+            } catch (IOException e) {
+                throw new SSRFError("connection failed");
+            }
+        } finally {
+            PINNED.remove();
+        }
+    }
+
+    private List<InetAddress> resolveTarget(String host) {
+        InetAddress literal = parseLiteral(host);
+        if (literal != null) {
+            // 2.2 校验域名：开启域名白名单时拒绝 IP 字面量直连
+            if (!ALLOWED_DOMAINS.isEmpty()) {
+                throw new SSRFError("IP literal not allowed with domain whitelist");
+            }
+            // 3. 校验 IP
+            checkIp(literal);
+            return Collections.singletonList(literal);
+        }
+        // 2.2 校验域名
+        if (!ALLOWED_DOMAINS.isEmpty() && !ALLOWED_DOMAINS.contains(host)) {
+            throw new SSRFError("domain not allowed");
+        }
+        // 3. 校验 IP：解析全部 A/AAAA 记录并逐一校验
+        List<InetAddress> addrs = resolveAll(host);
+        for (InetAddress addr : addrs) {
+            checkIp(addr);
+        }
+        return addrs;
+    }
+
+    private static List<InetAddress> resolveAll(String host) {
+        try {
+            InetAddress[] arr = InetAddress.getAllByName(host);
+            if (arr.length == 0) {
+                throw new SSRFError("no address resolved");
+            }
+            return Arrays.asList(arr);
+        } catch (UnknownHostException e) {
+            throw new SSRFError("DNS resolution failed");
+        }
+    }
+
+    /**
+     * 处理 IP 字面量：规范的点分十进制 IPv4 / 标准 IPv6 才放行，其余畸形格式一律拒绝
+     */
+    private static InetAddress parseLiteral(String host) {
+        String h = host;
+        if (h.startsWith("[") && h.endsWith("]")) {
+            h = h.substring(1, h.length() - 1);
+        }
+        if (h.indexOf(':') >= 0) {
+            try {
+                return InetAddress.getByName(h);
+            } catch (UnknownHostException e) {
+                throw new SSRFError("invalid IP literal");
+            }
+        }
+        if (h.toLowerCase(Locale.ROOT).startsWith("0x")) {
+            throw new SSRFError("non-canonical IP format");
+        }
+        if (h.matches("[0-9.]+")) {
+            if (!IPV4_CANONICAL.matcher(h).matches()) {
+                throw new SSRFError("non-canonical IP format");
+            }
+            String[] parts = h.split("\\.");
+            byte[] bytes = new byte[4];
+            for (int i = 0; i < 4; i++) {
+                bytes[i] = (byte) Integer.parseInt(parts[i]);
+            }
+            try {
+                return InetAddress.getByAddress(bytes);
+            } catch (UnknownHostException e) {
+                throw new IllegalStateException(e);
+            }
+        }
+        return null;
+    }
+
+    private static void checkIp(InetAddress addr) {
+        InetAddress normalized = normalize(addr);
+        for (Cidr cidr : BLOCKLIST) {
+            if (cidr.contains(normalized)) {
+                throw new SSRFError("target IP is blocked");
+            }
+        }
+    }
+
+    /**
+     * IPv4 映射的 IPv6 地址（::ffff:a.b.c.d）归一化为 IPv4 再走 IPv4 黑名单
+     * @param addr 标准InetAddress
+     * @return 归一化后的InetAddress结果
+     */
+    private static InetAddress normalize(InetAddress addr) {
+        if (addr instanceof Inet6Address) {
+            byte[] b = addr.getAddress();
+            boolean mapped = true;
+            for (int i = 0; i < 10; i++) {
+                if (b[i] != 0) {
+                    mapped = false;
+                    break;
+                }
+            }
+            if (mapped && b[10] == (byte) 0xff && b[11] == (byte) 0xff) {
+                try {
+                    return InetAddress.getByAddress(Arrays.copyOfRange(b, 12, 16));
+                } catch (UnknownHostException ignored) {
+                }
+            }
+        }
+        return addr;
+    }
+
+    private static URI parse(String url) {
+        if (url == null || url.isEmpty() || url.length() > MAX_URL_LENGTH) {
+            throw new SSRFError("invalid URL");
+        }
+        try {
+            return new URI(url);
+        } catch (URISyntaxException e) {
+            throw new SSRFError("malformed URL");
+        }
+    }
+
+    private static String formatUrl(URI uri, String host, int port) {
+        StringBuilder sb = new StringBuilder();
+        sb.append(uri.getScheme()).append("://");
+        if (host.indexOf(':') >= 0) {
+            sb.append('[').append(host).append(']');
+        } else {
+            sb.append(host);
+        }
+        if (port != -1) {
+            sb.append(':').append(port);
+        }
+        String path = uri.getRawPath();
+        if (path == null || path.isEmpty()) {
+            sb.append('/');
+        } else {
+            sb.append(path);
+        }
+        if (uri.getRawQuery() != null) {
+            sb.append('?').append(uri.getRawQuery());
+        }
+        if (uri.getRawFragment() != null) {
+            sb.append('#').append(uri.getRawFragment());
+        }
+        return sb.toString();
+    }
+
+    private static boolean isRedirect(int status) {
+        return status == 301 || status == 302 || status == 303 || status == 307 || status == 308;
+    }
+
+    static final class Cidr {
+        private final InetAddress network;
+        private final int prefixLength;
+
+        private Cidr(InetAddress network, int prefixLength) {
+            this.network = network;
+            this.prefixLength = prefixLength;
+        }
+
+        static Cidr of(String spec) {
+            String[] parts = spec.split("/");
+            try {
+                return new Cidr(InetAddress.getByName(parts[0]), Integer.parseInt(parts[1]));
+            } catch (UnknownHostException e) {
+                throw new IllegalArgumentException("bad CIDR: " + spec, e);
+            }
+        }
+
+        boolean contains(InetAddress addr) {
+            byte[] a = addr.getAddress();
+            byte[] n = network.getAddress();
+            if (a.length != n.length) {
+                return false;
+            }
+            int bits = prefixLength;
+            for (int i = 0; i < a.length && bits > 0; i++) {
+                int consume = Math.min(8, bits);
+                int mask = (0xff << (8 - consume)) & 0xff;
+                if ((a[i] & mask) != (n[i] & mask)) {
+                    return false;
+                }
+                bits -= consume;
+            }
+            return true;
+        }
+
+        @Override
+        public String toString() {
+            return network.getHostAddress() + "/" + prefixLength;
+        }
+    }
+}
+```
+
+**使用与注意：**
+
+- 依赖 OkHttp（`3.14.x`、`4.x`、`5.x` 均可，均兼容 Java 8），本文使用的 `Dns` / `OkHttpClient` / `Request` / `Response` API 在各版本间一致
+- `OkHttpClient` 作为共享单例复用连接池；pinned IP 通过 `ThreadLocal` 隔离到每个请求线程，并发请求间互不串扰
+- 生产环境如需自定义 CA（如企业内网 CA），可通过 `OkHttpClient.Builder().sslSocketFactory(...)` 与 `.hostnameVerifier(...)` 配置
 
