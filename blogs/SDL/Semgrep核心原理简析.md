@@ -3,6 +3,7 @@ title: Semgrep核心原理简析
 date: 2026/08/03
 tags:
   - 应用安全
+  - SAST
 categories:
   - SDL
 ---

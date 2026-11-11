@@ -3,6 +3,7 @@ title: Semgrep执行顺序及特性总结
 date: 2026/10/26
 tags:
   - 应用安全
+  - SAST
 categories:
   - SDL
 ---
