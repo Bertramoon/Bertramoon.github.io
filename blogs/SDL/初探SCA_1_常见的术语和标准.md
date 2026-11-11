@@ -272,7 +272,7 @@ Software Package Data Exchange/System Package Data Exchange。SPDX更**侧重许
 
 不是。SCA一般支持两种扫描模式，如下图所示，可以是直接分析，也可以先生成中间产物SBOM再进行匹配。注意，SBOM这个中间产物并不会让扫描更准确，而是提供了一个标准化的组件文件，使得生成SBOM组件清单和最终进行SCA分析两个过程可以独立，也就使得SCA产品更换、向第三方提供组件清单等变得更方便
 
-<img src="初探SCA_1_常见的术语和标准.assets/image-20261101210554135.png" alt="image-20261101210554135" style="zoom: 50%;" />
+<img src="初探SCA_1_常见的术语和标准.assets/image-20261101210554135.png" alt="image-20261101210554135" style="zoom: 67%;" />
 
 #### 2、SBOM跟CycloneDX/SPDX的关系是什么？
 
@@ -484,7 +484,7 @@ CVSS、EPSS、KEV三者衡量的问题维度不同，但共同为现代企业组
 
 3、函数级可达、数据流可达和运行时可达分析其实是降噪手段，即使**检测不出来也不意味着就绝对没问题**。例如，由于语言的高级特性（反射、动态加载等），完全可能存在函数级可达和数据流可达分析找不到的情况
 
-<img src="初探SCA_1_常见的术语和标准.assets/image-20261109083533951.png" alt="image-20261109083533951" style="zoom:50%;" />
+<img src="初探SCA_1_常见的术语和标准.assets/image-20261109083533951.png" alt="image-20261109083533951" style="zoom: 80%;" />
 
 #### VEX
 
